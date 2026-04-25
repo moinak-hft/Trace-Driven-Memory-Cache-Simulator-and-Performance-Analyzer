@@ -6,7 +6,7 @@ def get_value(output, key):
     return float(match.group(1)) if match else 0.0
 
 def main():
-    policies = ["lru", "fifo", "random", "lfu", "mru", "optimal"]
+    policies = ["lru", "fifo", "random", "lfu", "mru", "optimal", "custom"]
     
     print(f"{'POLICY':<10} | {'HIT RATE %':<12} | {'MISS RATE %':<12} | {'EVICTIONS':<12} | {'WRITE BACKS'}")
     print("-" * 68)

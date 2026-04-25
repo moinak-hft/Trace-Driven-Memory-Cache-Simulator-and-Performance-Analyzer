@@ -1,6 +1,9 @@
 #include <bits/stdc++.h>
 using namespace std;
-
+#define pb push_back
+#define F first
+#define S second
+using u64 = uint64_t;
 enum class Policy
 {
     LRU,
@@ -25,13 +28,15 @@ enum class AllocatePolicy
 struct Access
 {
     char type;
-    uint64_t addr;
+    u64 ip;
+    u64 addr;
 };
 
 struct Line
 {
     bool valid = false, dirty = false;
-    uint64_t block = 0, inserted = 0, last_used = 0, freq = 0;
+    u64 block = 0, inserted = 0, last_used = 0, freq = 0;
+    u64 expected_next_use = 0;
 };
 
 static string lower_copy(string s)
@@ -81,7 +86,7 @@ static AllocatePolicy parse_alloc_policy(const string &s)
     throw runtime_error("Unknown allocation policy: " + s);
 }
 
-static uint64_t parse_u64(const string &s)
+static u64 parse_u64(const string &s)
 {
     return stoull(s, nullptr, 0);
 }
@@ -98,10 +103,13 @@ class CacheSimulator
     WritePolicy write_policy;
     AllocatePolicy alloc_policy;
     vector<vector<Line>> sets;
-    unordered_map<uint64_t, deque<uint64_t>> future;
+    unordered_map<u64, deque<u64>> future;
     mt19937_64 rng;
-    uint64_t clock_tick = 0;
+    u64 clock_tick = 0;
     bool optimal_ready = false;
+
+    unordered_map<u64, u64> global_block_last_access;
+    unordered_map<u64, double> pc_ewma;
 
     int choose_victim(const vector<Line> &set)
     {
@@ -115,7 +123,7 @@ class CacheSimulator
 
         if (policy == Policy::FIFO)
         {
-            uint64_t best = set[0].inserted;
+            u64 best = set[0].inserted;
             for (size_t i = 1; i < associativity; ++i)
             {
                 if (set[i].inserted < best)
@@ -129,7 +137,7 @@ class CacheSimulator
 
         if (policy == Policy::LRU)
         {
-            uint64_t best = set[0].last_used;
+            u64 best = set[0].last_used;
             for (size_t i = 1; i < associativity; ++i)
             {
                 if (set[i].last_used < best)
@@ -143,7 +151,7 @@ class CacheSimulator
 
         if (policy == Policy::MRU)
         {
-            uint64_t best = set[0].last_used;
+            u64 best = set[0].last_used;
             for (size_t i = 1; i < associativity; ++i)
             {
                 if (set[i].last_used > best)
@@ -157,8 +165,8 @@ class CacheSimulator
 
         if (policy == Policy::LFU)
         {
-            uint64_t best_freq = set[0].freq;
-            uint64_t best_time = set[0].last_used;
+            u64 best_freq = set[0].freq;
+            u64 best_time = set[0].last_used;
             for (size_t i = 1; i < associativity; ++i)
             {
                 if (set[i].freq < best_freq || (set[i].freq == best_freq && set[i].last_used < best_time))
@@ -173,11 +181,11 @@ class CacheSimulator
 
         if (policy == Policy::OPTIMAL)
         {
-            uint64_t farthest = 0;
+            u64 farthest = 0;
             for (size_t i = 0; i < associativity; ++i)
             {
                 auto it = future.find(set[i].block);
-                uint64_t next_use = ULLONG_MAX;
+                u64 next_use = ULLONG_MAX;
                 if (it != future.end() && !it->second.empty())
                     next_use = it->second.front();
                 if (next_use == ULLONG_MAX)
@@ -191,10 +199,24 @@ class CacheSimulator
             return victim;
         }
 
-        uint64_t bestMini = set[0].freq * 1000000000ULL + set[0].last_used;
+        if (policy == Policy::CUSTOM)
+        {
+            u64 farthest = 0;
+            for (size_t i = 0; i < associativity; ++i)
+            {
+                if (set[i].expected_next_use > farthest)
+                {
+                    farthest = set[i].expected_next_use;
+                    victim = static_cast<int>(i);
+                }
+            }
+            return victim;
+        }
+
+        u64 bestMini = set[0].freq * 1000000000ULL + set[0].last_used;
         for (size_t i = 1; i < associativity; ++i)
         {
-            uint64_t score = set[i].freq * 1000000000ULL + set[i].last_used;
+            u64 score = set[i].freq * 1000000000ULL + set[i].last_used;
             if (score < bestMini)
             {
                 bestMini = score;
@@ -205,7 +227,7 @@ class CacheSimulator
     }
 
 public:
-    uint64_t total_accesses = 0, reads = 0, writes = 0, hits = 0, misses = 0, evictions = 0, write_backs = 0, mem_writes = 0;
+    u64 total_accesses = 0, reads = 0, writes = 0, hits = 0, misses = 0, evictions = 0, write_backs = 0, mem_writes = 0;
 
     CacheSimulator(size_t cache_size_,
                    size_t block_size_,
@@ -236,15 +258,15 @@ public:
     void preprocess_optimal(const vector<Access> &trace)
     {
         future.clear();
-        for (uint64_t i = 0; i < trace.size(); ++i)
+        for (u64 i = 0; i < trace.size(); ++i)
         {
-            uint64_t block = trace[i].addr / block_size;
+            u64 block = trace[i].addr / block_size;
             future[block].push_back(i);
         }
         optimal_ready = true;
     }
 
-    void access(uint64_t addr, char type, uint64_t pos)
+    void access(u64 addr, char type, u64 pos, u64 ip)
     {
         total_accesses++;
         if (is_write(type))
@@ -252,10 +274,25 @@ public:
         else
             reads++;
 
-        uint64_t block = addr / block_size;
+        u64 block = addr / block_size;
         size_t set_idx = static_cast<size_t>(block % num_sets);
-        uint64_t tag = block / num_sets;
         auto &set = sets[set_idx];
+
+        u64 rd = 100000000ULL;
+        if (global_block_last_access.count(block))
+        {
+            rd = clock_tick - global_block_last_access[block];
+        }
+        global_block_last_access[block] = clock_tick;
+
+        if (pc_ewma.count(ip) == 0)
+        {
+            pc_ewma[ip] = static_cast<double>(rd);
+        }
+        else
+        {
+            pc_ewma[ip] = 0.125 * rd + 0.875 * pc_ewma[ip];
+        }
 
         if (policy == Policy::OPTIMAL && optimal_ready)
         {
@@ -284,6 +321,8 @@ public:
             auto &line = set[hit_idx];
             line.last_used = ++clock_tick;
             line.freq++;
+            line.expected_next_use = clock_tick + static_cast<u64>(pc_ewma[ip]);
+
             if (is_write(type))
             {
                 if (write_policy == WritePolicy::WRITE_BACK)
@@ -324,6 +363,7 @@ public:
         line.inserted = ++clock_tick;
         line.last_used = clock_tick;
         line.freq = 1;
+        line.expected_next_use = clock_tick + static_cast<u64>(pc_ewma[ip]);
 
         if (is_write(type) && write_policy == WritePolicy::WRITE_THROUGH)
             mem_writes++;
@@ -375,9 +415,17 @@ static bool parse_trace_line(const string &line, Access &a)
     if (t != 'R' && t != 'W')
         return false;
 
-    string addr_s = tok.back();
     a.type = t;
-    a.addr = parse_u64(addr_s);
+    if (tok.size() >= 3)
+    {
+        a.ip = parse_u64(tok[1]);
+        a.addr = parse_u64(tok.back());
+    }
+    else
+    {
+        a.ip = 0;
+        a.addr = parse_u64(tok.back());
+    }
     return true;
 }
 
@@ -468,9 +516,9 @@ int main(int argc, char *argv[])
         if (policy == Policy::OPTIMAL)
             sim.preprocess_optimal(trace);
 
-        for (uint64_t i = 0; i < trace.size(); ++i)
+        for (u64 i = 0; i < trace.size(); ++i)
         {
-            sim.access(trace[i].addr, trace[i].type, i);
+            sim.access(trace[i].addr, trace[i].type, i, trace[i].ip);
         }
 
         sim.print_report();

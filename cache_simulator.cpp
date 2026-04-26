@@ -4,6 +4,7 @@ using namespace std;
 #define F first
 #define S second
 using u64 = uint64_t;
+
 enum class Policy
 {
     LRU,
@@ -36,7 +37,6 @@ struct Line
 {
     bool valid = false, dirty = false;
     u64 block = 0, inserted = 0, last_used = 0, freq = 0;
-    u64 expected_next_use = 0;
 };
 
 static string lower_copy(string s)
@@ -63,7 +63,8 @@ static Policy parse_policy(const string &s)
         return Policy::OPTIMAL;
     if (x == "custom")
         return Policy::CUSTOM;
-    throw runtime_error("Unknown policy: " + s);
+    cerr << "Unknown policy: " << s << "\n";
+    exit(1);
 }
 
 static WritePolicy parse_write_policy(const string &s)
@@ -73,7 +74,8 @@ static WritePolicy parse_write_policy(const string &s)
         return WritePolicy::WRITE_BACK;
     if (x == "wt" || x == "writethrough" || x == "write-through")
         return WritePolicy::WRITE_THROUGH;
-    throw runtime_error("Unknown write policy: " + s);
+    cerr << "Unknown write policy: " << s << "\n";
+    exit(1);
 }
 
 static AllocatePolicy parse_alloc_policy(const string &s)
@@ -83,7 +85,8 @@ static AllocatePolicy parse_alloc_policy(const string &s)
         return AllocatePolicy::WRITE_ALLOCATE;
     if (x == "nwa" || x == "no-write-allocate" || x == "nowriteallocate")
         return AllocatePolicy::NO_WRITE_ALLOCATE;
-    throw runtime_error("Unknown allocation policy: " + s);
+    cerr << "Unknown allocation policy: " << s << "\n";
+    exit(1);
 }
 
 static u64 parse_u64(const string &s)
@@ -107,9 +110,6 @@ class CacheSimulator
     mt19937_64 rng;
     u64 clock_tick = 0;
     bool optimal_ready = false;
-
-    unordered_map<u64, u64> global_block_last_access;
-    unordered_map<u64, double> pc_ewma;
 
     int choose_victim(const vector<Line> &set)
     {
@@ -147,6 +147,32 @@ class CacheSimulator
                 }
             }
             return victim;
+        }
+
+        if (policy == Policy::CUSTOM)
+        {
+            int unshielded_victim = -1;
+            u64 oldest_unshielded = ULLONG_MAX;
+            
+            int global_victim = 0;
+            u64 oldest_global = ULLONG_MAX;
+
+            for (size_t i = 0; i < associativity; ++i)
+            {
+                if (set[i].last_used < oldest_global)
+                {
+                    oldest_global = set[i].last_used;
+                    global_victim = static_cast<int>(i);
+                }
+
+                if (set[i].freq <= 1 && set[i].last_used < oldest_unshielded)
+                {
+                    oldest_unshielded = set[i].last_used;
+                    unshielded_victim = static_cast<int>(i);
+                }
+            }
+            
+            return (unshielded_victim != -1) ? unshielded_victim : global_victim;
         }
 
         if (policy == Policy::MRU)
@@ -199,31 +225,7 @@ class CacheSimulator
             return victim;
         }
 
-        if (policy == Policy::CUSTOM)
-        {
-            u64 farthest = 0;
-            for (size_t i = 0; i < associativity; ++i)
-            {
-                if (set[i].expected_next_use > farthest)
-                {
-                    farthest = set[i].expected_next_use;
-                    victim = static_cast<int>(i);
-                }
-            }
-            return victim;
-        }
-
-        u64 bestMini = set[0].freq * 1000000000ULL + set[0].last_used;
-        for (size_t i = 1; i < associativity; ++i)
-        {
-            u64 score = set[i].freq * 1000000000ULL + set[i].last_used;
-            if (score < bestMini)
-            {
-                bestMini = score;
-                victim = static_cast<int>(i);
-            }
-        }
-        return victim;
+        return 0; 
     }
 
 public:
@@ -244,14 +246,26 @@ public:
           rng(1337)
     {
         if (block_size == 0 || associativity == 0 || cache_size == 0)
-            throw runtime_error("Cache parameters must be non-zero");
+        {
+            cerr << "Cache parameters must be non-zero\n";
+            exit(1);
+        }
         if (cache_size < block_size * associativity)
-            throw runtime_error("Cache size must be at least block_size * associativity");
+        {
+            cerr << "Cache size must be at least block_size * associativity\n";
+            exit(1);
+        }
         if (cache_size % (block_size * associativity) != 0)
-            throw runtime_error("Cache size must be divisible by block_size * associativity");
+        {
+            cerr << "Cache size must be divisible by block_size * associativity\n";
+            exit(1);
+        }
         num_sets = cache_size / (block_size * associativity);
         if (num_sets == 0)
-            throw runtime_error("Number of sets became zero");
+        {
+            cerr << "Number of sets became zero\n";
+            exit(1);
+        }
         sets.assign(num_sets, vector<Line>(associativity));
     }
 
@@ -269,30 +283,11 @@ public:
     void access(u64 addr, char type, u64 pos, u64 ip)
     {
         total_accesses++;
-        if (is_write(type))
-            writes++;
-        else
-            reads++;
+        is_write(type) ? writes++ : reads++;
 
         u64 block = addr / block_size;
         size_t set_idx = static_cast<size_t>(block % num_sets);
         auto &set = sets[set_idx];
-
-        u64 rd = 100000000ULL;
-        if (global_block_last_access.count(block))
-        {
-            rd = clock_tick - global_block_last_access[block];
-        }
-        global_block_last_access[block] = clock_tick;
-
-        if (pc_ewma.count(ip) == 0)
-        {
-            pc_ewma[ip] = static_cast<double>(rd);
-        }
-        else
-        {
-            pc_ewma[ip] = 0.125 * rd + 0.875 * pc_ewma[ip];
-        }
 
         if (policy == Policy::OPTIMAL && optimal_ready)
         {
@@ -321,14 +316,10 @@ public:
             auto &line = set[hit_idx];
             line.last_used = ++clock_tick;
             line.freq++;
-            line.expected_next_use = clock_tick + static_cast<u64>(pc_ewma[ip]);
 
             if (is_write(type))
             {
-                if (write_policy == WritePolicy::WRITE_BACK)
-                    line.dirty = true;
-                else
-                    mem_writes++;
+                write_policy == WritePolicy::WRITE_BACK ? line.dirty = true : mem_writes++;
             }
             return;
         }
@@ -363,7 +354,6 @@ public:
         line.inserted = ++clock_tick;
         line.last_used = clock_tick;
         line.freq = 1;
-        line.expected_next_use = clock_tick + static_cast<u64>(pc_ewma[ip]);
 
         if (is_write(type) && write_policy == WritePolicy::WRITE_THROUGH)
             mem_writes++;
@@ -378,29 +368,18 @@ public:
 
     void print_report() const
     {
-        std::cout << "Total Accesses: " << total_accesses << '\n'
-                  << "Reads: " << reads << '\n'
-                  << "Writes: " << writes << '\n'
-                  << "Hits: " << hits << '\n'
-                  << "Misses: " << misses << '\n'
-                  << "Evictions: " << evictions << '\n'
-                  << "Write Backs: " << write_backs << '\n'
-                  << "Memory Writes: " << mem_writes << '\n';
-
         cout << fixed << setprecision(2);
         double total = total_accesses ? static_cast<double>(total_accesses) : 1.0;
         std::cout << "Hit Rate: " << (100.0 * hits / total) << "%\n"
                   << "Miss Rate: " << (100.0 * misses / total) << "%\n"
-                  << "Eviction Rate: " << (100.0 * evictions / total) << "%\n"
-                  << "Write Back Rate: " << (100.0 * write_backs / total) << "%\n";
+                  << "Evictions: " << evictions << "\n"
+                  << "Write Backs: " << write_backs << "\n";
     }
 };
 
 static bool parse_trace_line(const string &line, Access &a)
 {
-    if (line.empty())
-        return false;
-    if (line[0] == '#')
+    if (line.empty() || line[0] == '#')
         return false;
 
     stringstream ss(line);
@@ -433,7 +412,10 @@ static vector<Access> load_trace(const string &path)
 {
     ifstream in(path);
     if (!in.is_open())
-        throw runtime_error("Cannot open trace file: " + path);
+    {
+        cerr << "Cannot open trace file: " << path << "\n";
+        exit(1);
+    }
 
     vector<Access> trace;
     string line;
@@ -509,25 +491,16 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    try
-    {
-        vector<Access> trace = load_trace(trace_path);
-        CacheSimulator sim(cache_size, block_size, assoc, policy, write_policy, alloc_policy);
-        if (policy == Policy::OPTIMAL)
-            sim.preprocess_optimal(trace);
+    vector<Access> trace = load_trace(trace_path);
+    CacheSimulator sim(cache_size, block_size, assoc, policy, write_policy, alloc_policy);
+    if (policy == Policy::OPTIMAL)
+        sim.preprocess_optimal(trace);
 
-        for (u64 i = 0; i < trace.size(); ++i)
-        {
-            sim.access(trace[i].addr, trace[i].type, i, trace[i].ip);
-        }
-
-        sim.print_report();
-    }
-    catch (const exception &e)
+    for (u64 i = 0; i < trace.size(); ++i)
     {
-        cerr << e.what() << '\n';
-        return 1;
+        sim.access(trace[i].addr, trace[i].type, i, trace[i].ip);
     }
 
+    sim.print_report();
     return 0;
 }

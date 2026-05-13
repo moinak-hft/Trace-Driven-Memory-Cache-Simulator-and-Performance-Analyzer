@@ -1,50 +1,61 @@
 import subprocess
 import re
+import sys
 
-def get_value(output, key):
-    match = re.search(rf"{key}:\s*([0-9.]+)", output)
-    return float(match.group(1)) if match else 0.0
 
 def main():
-    policies = ["lru", "fifo", "random", "lfu", "mru", "optimal", "custom"]
-    
-    print(f"{'POLICY':<10} | {'HIT RATE %':<12} | {'MISS RATE %':<12} | {'EVICTIONS':<12} | {'WRITE BACKS'}")
-    print("-" * 68)
+    if len(sys.argv) < 3:
+        print("Usage: python3 benchmark.py <path_to_simulator> <path_to_trace>")
+        sys.exit(1)
 
-    best_policy = ""
-    best_hit_rate = -1.0
+    sPath = sys.argv[1]
+    trcPath = sys.argv[2]
 
-    for pol in policies:
+    policies = ["lru", "fifo", "random", "lfu", "mru", "optimal", "igbi"]
+
+    print(f"{'POLICY':<10} | {'HIT RATE (%)':<15} | {'MISS RATE (%)':<15} | {'EVICTIONS':<10} | {'WRITE BACKS'}")
+    print("-" * 75)
+
+    maxiPolicy = ""
+    maxiHit = -1.0
+
+    for p in policies:
         cmd = [
-            "./cache_simulator", 
-            "--size", "32768", 
-            "--block", "64", 
-            "--assoc", "8", 
-            "--policy", pol, 
-            "--write", "wb", 
-            "--alloc", "wa", 
-            "pinatrace.out"
+            sPath,
+            "--size", "65536",
+            "--block", "128",
+            "--assoc", "16",
+            "--policy", p,
+            "--write", "wb",
+            "--trace", trcPath
         ]
-        
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        
-        if res.returncode != 0:
-            print(f"Error running policy {pol}")
-            continue
-            
-        hit_rate = get_value(res.stdout, "Hit Rate")
-        miss_rate = get_value(res.stdout, "Miss Rate")
-        evictions = int(get_value(res.stdout, "Evictions"))
-        write_backs = int(get_value(res.stdout, "Write Backs"))
-        
-        print(f"{pol.upper():<10} | {hit_rate:<12.2f} | {miss_rate:<12.2f} | {evictions:<12} | {write_backs}")
-        
-        if hit_rate > best_hit_rate:
-            best_hit_rate = hit_rate
-            best_policy = pol
 
-    print("-" * 68)
-    print(f"\nResult: The best performing algorithm is {best_policy.upper()} with a Hit Rate of {best_hit_rate:.2f}%.")
+        res = subprocess.run(cmd, capture_output=True, text=True)
+
+        if res.returncode != 0:
+            print(f"{p.upper():<10} | FAILED TO RUN")
+            continue
+
+        out = res.stdout
+
+        try:
+            hit = float(re.search(r"Hit Rate:\s*([0-9.]+)", out).group(1))
+            miss = float(re.search(r"Miss Rate:\s*([0-9.]+)", out).group(1))
+            evic = int(re.search(r"Evictions:\s*([0-9]+)", out).group(1))
+            wb = int(re.search(r"Write Backs:\s*([0-9]+)", out).group(1))
+
+            print(f"{p.upper():<10} | {hit:<15.2f} | {miss:<15.2f} | {evic:<10} | {wb}")
+
+            if p != "optimal" and hit > maxiHit:
+                maxiHit = hit
+                maxiPolicy = p.upper()
+
+        except AttributeError:
+            print(f"{p.upper():<10} | PARSE ERROR")
+
+    print("-" * 75)
+    print(f"Result: The best performing realistic algorithm is {maxiPolicy} with a Hit Rate of {maxiHit:.2f}%.")
+
 
 if __name__ == "__main__":
     main()

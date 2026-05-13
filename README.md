@@ -1,126 +1,197 @@
-# ⚡ Trace-Driven Memory Cache Simulator & Performance Analyzer
+# Cache Simulator Project
 
-A high-performance, deterministic memory cache simulation engine built for deep architectural analysis and quantitative workload evaluation. 
+A cache-simulation toolkit with:
 
-This project leverages Intel Pin for dynamic binary instrumentation (DBI) to extract granular memory access patterns at runtime, and feeds those traces into a highly optimized, dynamically configurable C++17 simulator. The engine is designed from first principles to evaluate memory replacement policies, ranging from standard deterministic logic to omniscient oracles and custom thrash-resistant algorithms.
-
-**Developed for CS204 by:**
-* Aryan Sandal (2024CSB1103) 
-* Moinak Goswami (2024CSB1225)
-
----
-
-## 🏗️ Core Architectural Components
-
-The system architecture is strictly decoupled into three highly specialized pipelines, isolating the overhead of trace generation from the speed of simulation.
-
-### 1. Dynamic Binary Instrumentation (Intel Pin)
-The trace generator (`pin_trace.cpp`) utilizes Intel Pin's Just-In-Time (JIT) compiler infrastructure. 
-* **Mechanism:** It intercepts instructions at the basic block level before CPU execution. Using `INS_MemoryOperandIsRead` and `INS_MemoryOperandIsWritten`, it identifies memory boundaries.
-* **Overhead Mitigation:** Instead of analyzing every instruction, it injects predicated calls (`INS_InsertPredicatedCall`) strictly on memory operands, capturing the Effective Address (EA) and Instruction Pointer (IP).
-* **I/O Streaming:** Raw access traces are buffered and streamed sequentially to disk (`pinatrace.out`) to prevent I/O blocking during target application execution.
-
-### 2. High-Frequency Simulation Engine
-The `cache_simulator` is a native C++ binary modeling an N-way set-associative hardware cache. 
-* **Bitwise Address Translation:** Floating-point division is entirely eliminated from the hot path. The engine calculates bit-shifts during initialization ($Offset Bits = \log_2(BlockSize)$) and utilizes heavily optimized bitwise masks to isolate Tags and Indexes in $O(1)$ time.
-* **Zero-Allocation Hot Path:** The cache grid is pre-allocated as a continuous block of memory via `std::vector<vector<Line>>`. During simulation, no dynamic memory is allocated or freed, ensuring strictly deterministic execution times even across multi-gigabyte trace files.
-
-### 3. Quantitative Validation Harness
-A Python test driver (`benchmark.py`) automates the execution of the compiled C++ binary, piping various geometric configurations and replacement policies into the engine. It parses the standard output via regex to generate a comparative, tabular matrix of hit/miss ratios, write-backs, and eviction counts.
+- a configurable cache simulator,
+- an Intel Pin-based memory tracer,
+- a synthetic workload generator,
+- a test driver for validation, and
+- a benchmark script for comparing replacement policies.
 
 ---
 
-## 🧮 Configurable Cache Geometries
+## Overview
 
-The simulator allows for command-line manipulation of the physical cache geometry, enabling sensitivity analysis across different hardware constraints:
+This project traces memory accesses from a target program and feeds them into a cache simulator. The simulator supports multiple replacement, write, and allocation policies, making it useful for studying cache behavior under different configurations.
 
-* **`--size` (Capacity):** Total bytes allocated to the simulated cache.
-* **`--block` (Line Size):** The spatial locality fetch size (typically 64 bytes).
-* **`--assoc` (Associativity):** The number of ways per set (e.g., 1 for Direct Mapped, 8 for 8-way, or N for Fully Associative).
-* **`--write` (Write Policy):** * `wb` (Write-Back): Defers memory writes until eviction, utilizing a `dirty` bit.
-  * `wt` (Write-Through): Commits writes to memory immediately.
-* **`--alloc` (Allocation Policy):** * `wa` (Write-Allocate): Fetches the block on a write miss.
-  * `nwa` (No-Write-Allocate): Bypasses the cache on a write miss.
+The main components are:
 
----
-
-## 🧠 Algorithmic Implementations & Time Complexity
-
-The engine implements multiple replacement policies, managing victim selection when a cache set reaches capacity.
-
-### Standard Deterministic Policies
-* **LRU (Least Recently Used):** Evaluated using a monotonically increasing 64-bit clock tick. On a hit, the block's `last_used` timestamp is updated. *Time Complexity: $O(Associativity)$ for victim search.*
-* **FIFO (First-In, First-Out):** Utilizes an immutable `inserted` timestamp captured when the block enters the cache. *Time Complexity: $O(Associativity)$.*
-* **MRU (Most Recently Used):** Evicts the block with the highest `last_used` tick. Designed for specific cyclic access patterns. *Time Complexity: $O(Associativity)$.*
-* **LFU (Least Frequently Used):** Tracks raw access counts via a `freq` variable. To prevent cache pollution from stale ties (blocks used heavily once and never again), LFU strictly falls back to LRU logic as a secondary tie-breaker. *Time Complexity: $O(Associativity)$.*
-* **RANDOM:** Utilizes `<random>` with a deterministic seed (`mt19937_64`) to uniformly select a victim index. Serves as a low-overhead baseline. *Time Complexity: $O(1)$.*
-
-### Advanced & Omniscient Policies
-* **OPTIMAL (Belady's MIN Algorithm):** Establishes the absolute theoretical mathematical ceiling for cache hit rates on a given trace.   
-  * **Mechanism:** It operates via a two-pass oracle mechanism. The `preprocess_optimal` pass maps all future accesses into a dynamic hash map of deques (`unordered_map<uint64_t, deque<uint64_t>>`).   
-  * **Victim Selection:** During the simulation pass, it scans the cache set and evicts the block whose next required access is furthest in the absolute future (or `ULLONG_MAX` if it will never be accessed again).  
-  * **Space Complexity:** $O(N)$ where N is the total number of memory accesses in the trace.
-* **CUSTOM (Frequency-Shielded LRU):** A proprietary, thrash-resistant algorithm built specifically to defeat cache pollution caused by massive linear disk scans (e.g., directory traversals in `/bin/ls` or matrix streaming).   
-  * **Mechanism:** It establishes a **Frequency Shield**. Any cache line with a frequency $> 1$ is mathematically protected.   
-  * **Victim Selection:** When the set is full, the algorithm performs a dual-scan. It aggressively targets unshielded blocks ($frequency = 1$) for eviction, using LRU to break ties among them. Shielded blocks are only vulnerable if the entire set is shielded. This completely isolates valuable temporal data (stack frames, active pointers) from being overwritten by one-hit-wonder array streams.
+- `cache_simulator.cpp` — the cache simulator core
+- `pin_trace.cpp` — Intel Pin tool that records memory reads/writes
+- `target_workload.cpp` — sample program used to generate memory activity
+- `test_driver.py` — automated correctness checks
+- `benchmark.py` — runs the simulator across several policies and summarizes the results
 
 ---
 
-## 📊 Anatomy of a Simulated Cache Line
+## Features
 
-To minimize memory overhead and replicate hardware structures, the internal `Line` struct is heavily compressed:
+- Replacement policies: `lru`, `fifo`, `random`, `lfu`, `mru`, `optimal`, `igbi`
+- Write policies: `wb`, `wt`
+- Allocation policies: `wa`, `nwa`
+- Trace parsing from Intel Pin output
+- Statistics reporting:
+  - hit rate
+  - miss rate
+  - evictions
+  - write backs
+- Benchmarking across multiple policies using the same trace
 
-```cpp
-struct Line {
-    bool valid;          
-    bool dirty;          
-    uint64_t block;      
-    uint64_t inserted;   
-    uint64_t last_used;  
-    uint64_t freq;       
-};
-```
 ---
 
-## ⚙ Compilation & Execution Guide
+## How It Works
 
-## Prerequisites
-- Intel Pin 3.28 (Linux)
-- GCC/G++ compiler with C++17 standard support
-- Python 3.x for benchmarking
+1. `target_workload` runs under Intel Pin.
+2. `pin_trace.so` records each memory read/write into a trace file.
+3. `cache_simulator` consumes that trace and simulates cache behavior.
+4. `test_driver.py` verifies expected results on small controlled cases.
+5. `benchmark.py` compares policies on a larger trace and prints a summary table.
 
-## Step 1: Trace Generation
-Move the instrumentation code into the Intel Pin hierarchy, compile the `.so` shared object, and execute it against a target workload.
+---
 
-```bash
-cp pin_trace.cpp pin-3.28-98749-g6643ceee5-gcc-linux/source/tools/MyPinTool/MyPinTool.cpp
-cd pin-3.28-98749-g6643ceee5-gcc-linux/source/tools/MyPinTool
-make obj-intel64/MyPinTool.so TARGET=intel64
-cd ../../../../
-./pin-3.28-98749-g6643ceee5-gcc-linux/pin -t pin-3.28-98749-g6643ceee5-gcc-linux/source/tools/MyPinTool/obj-intel64/MyPinTool.so -- pinatrace.out
+## Repository Structure
+
+```text
+.
+├── benchmark.py
+├── cache_simulator.cpp
+├── pin_trace.cpp
+├── target_workload.cpp
+├── test_driver.py
+└── README.md
 ```
 
-## Step 2: Engine Compilation
-Compile the simulation engine natively. Maximum level-3 optimization (-O3) is mandatory for traversing datasets with millions of access vectors efficiently.
+---
+
+## Simulator Options
+
+The simulator accepts the following command-line options:
+
+- `--size <bytes>`: total cache size
+- `--block <bytes>`: block size
+- `--assoc <ways>`: associativity
+- `--policy <name>`: cache replacement policy
+- `--write <wb|wt>`: write-back or write-through
+- `--alloc <wa|nwa>`: write-allocate or no-write-allocate
+- `--trace <file>`: trace file path
+
+Example:
 
 ```bash
+./cache_simulator --size 65536 --block 128 --assoc 16 --policy igbi --write wb --trace pinatrace.out
+```
+
+---
+
+## Output Format
+
+The simulator prints:
+
+- `Hit Rate`
+- `Miss Rate`
+- `Evictions`
+- `Write Backs`
+
+This format is used directly by both `benchmark.py` and `test_driver.py`.
+
+---
+
+## Automated Testing
+
+Run the test driver to validate the simulator on a few known cases:
+
+```bash
+python3 test_driver.py ./cache_simulator
+```
+
+The test driver checks:
+
+- basic hit/miss behavior,
+- thrashing behavior,
+- write policy behavior,
+- and the IGBI path.
+
+---
+
+## Benchmarking
+
+Run the benchmark script to compare policies on a trace:
+
+```bash
+python3 benchmark.py ./cache_simulator pinatrace.out
+```
+
+The script evaluates:
+
+- `LRU`
+- `FIFO`
+- `RANDOM`
+- `LFU`
+- `MRU`
+- `OPTIMAL`
+- `IGBI`
+
+and prints the best-performing realistic policy based on hit rate.
+
+---
+
+## Compilation Guide
+
+Follow these steps to compile and run the project successfully:
+
+```bash
+g++ -O3 target_workload.cpp -o target_workload
 g++ -O3 -std=c++17 cache_simulator.cpp -o cache_simulator
+
+cd pin-3.28-98749-g6643ecee5-gcc-linux/source/tools/MyPinTool
+make obj-intel64/pin_trace.so TARGET=intel64
+cd ../../../../
+
+cd /workspaces/CS-204_Project
+cp pin_trace.cpp pin-3.28-98749-g6643ecee5-gcc-linux/source/tools/MyPinTool/
+cd pin-3.28-98749-g6643ecee5-gcc-linux/source/tools/MyPinTool
+make obj-intel64/pin_trace.so TARGET=intel64
+cd ../../../../
+
+./pin-3.28-98749-g6643ecee5-gcc-linux/pin -t pin-3.28-98749-g6643ecee5-gcc-linux/source/tools/MyPinTool/obj-intel64/pin_trace.so -- ./target_workload
+
+python3 test_driver.py ./cache_simulator
+
+python3 benchmark.py ./cache_simulator pinatrace.out
+
+./cache_simulator --size 65536 --block 128 --assoc 16 --policy igbi --write wb --trace pinatrace.out
 ```
 
-## Step 3: Automated Validation Benchmarking
-Execute the Python wrapper to run sensitivity analysis across all algorithms. The script automatically pipes the generated pinatrace.out through the compiled binary.
+### Notes
+
+- Make sure the Intel Pin directory name matches your local installation.
+- If your project folder is different from `/workspaces/CS-204_Project`, update that path before copying `pin_trace.cpp`.
+- The trace file produced by the Pin tool is typically `pinatrace.out`.
+
+---
+
+## Example Workflow
 
 ```bash
-python3 benchmark.py
+# 1) Build the target workload and simulator
+./target_workload
+
+# 2) Generate a trace using Pin
+./pin-3.28-98749-g6643ecee5-gcc-linux/pin -t pin-3.28-98749-g6643ecee5-gcc-linux/source/tools/MyPinTool/obj-intel64/pin_trace.so -- ./target_workload
+
+# 3) Validate the simulator
+python3 test_driver.py ./cache_simulator
+
+# 4) Compare policies
+python3 benchmark.py ./cache_simulator pinatrace.out
 ```
 
-### Manual Execution Example
-To bypass the benchmark wrapper and test a highly specific cache geometry:
-```bash
-./cache_simulator --size 65536 --block 128 --assoc 16 --policy custom --write wb --alloc wa pinatrace.out
-```
+---
 
-## Notes:-
-*  pinatrace.out is the trace file generated by Intel Pin instrumentation.
-*  The simulator binary is built from cache_simulator.cpp.
-*  The benchmark script automates multiple runs and validation checks.
+## Acknowledgements
+
+This project uses Intel Pin for dynamic binary instrumentation and trace generation.
+
+## Project Member's.
+   1) Aryan Sandal 2024CSB1103  
+   2) Moinak Goswami 2024CSB1225

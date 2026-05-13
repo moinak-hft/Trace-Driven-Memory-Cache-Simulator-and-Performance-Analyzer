@@ -4,503 +4,339 @@ using namespace std;
 #define F first
 #define S second
 using u64 = uint64_t;
+using st = size_t;
+#define rep(i, a, b) for (st i = a; i < b; i++)
 
-enum class Policy
-{
-    LRU,
-    FIFO,
-    RANDOM,
-    LFU,
-    MRU,
-    OPTIMAL,
-    CUSTOM
-};
-enum class WritePolicy
-{
-    WRITE_BACK,
-    WRITE_THROUGH
-};
-enum class AllocatePolicy
-{
-    WRITE_ALLOCATE,
-    NO_WRITE_ALLOCATE
-};
+enum Policy { P_LRU, P_FIFO, P_RAND, P_LFU, P_MRU, P_OPT, P_IGBI };
+enum WritePolicy { WB, WT };
+enum AllocPolicy { WA, NWA };
 
 struct Access
 {
     char type;
-    u64 ip;
-    u64 addr;
+    u64 ip, addr;
 };
 
 struct Line
 {
     bool valid = false, dirty = false;
-    u64 block = 0, inserted = 0, last_used = 0, freq = 0;
+    u64 block = 0, inserted = 0, lastUse = 0, freq = 0, ip = 0;
 };
 
-static string lower_copy(string s)
+Policy parse_pol(string s)
 {
     for (char &c : s)
-        c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
-    return s;
-}
-
-static Policy parse_policy(const string &s)
-{
-    string x = lower_copy(s);
-    if (x == "lru")
-        return Policy::LRU;
-    if (x == "fifo")
-        return Policy::FIFO;
-    if (x == "random")
-        return Policy::RANDOM;
-    if (x == "lfu")
-        return Policy::LFU;
-    if (x == "mru")
-        return Policy::MRU;
-    if (x == "optimal" || x == "belady" || x == "min")
-        return Policy::OPTIMAL;
-    if (x == "custom")
-        return Policy::CUSTOM;
-    cerr << "Unknown policy: " << s << "\n";
+        c = tolower(c);
+    if (s == "lru")
+        return P_LRU;
+    if (s == "fifo")
+        return P_FIFO;
+    if (s == "random")
+        return P_RAND;
+    if (s == "lfu")
+        return P_LFU;
+    if (s == "mru")
+        return P_MRU;
+    if (s == "optimal" || s == "belady" || s == "min")
+        return P_OPT;
+    if (s == "custom" || s == "igbi")
+        return P_IGBI;
     exit(1);
 }
 
-static WritePolicy parse_write_policy(const string &s)
+WritePolicy parse_wp(string s)
 {
-    string x = lower_copy(s);
-    if (x == "wb" || x == "writeback" || x == "write-back")
-        return WritePolicy::WRITE_BACK;
-    if (x == "wt" || x == "writethrough" || x == "write-through")
-        return WritePolicy::WRITE_THROUGH;
-    cerr << "Unknown write policy: " << s << "\n";
+    for (char &c : s)
+        c = tolower(c);
+    if (s == "wb" || s == "writeback")
+        return WB;
+    if (s == "wt" || s == "writethrough")
+        return WT;
     exit(1);
 }
 
-static AllocatePolicy parse_alloc_policy(const string &s)
+AllocPolicy parse_ap(string s)
 {
-    string x = lower_copy(s);
-    if (x == "wa" || x == "writeallocate" || x == "write-allocate")
-        return AllocatePolicy::WRITE_ALLOCATE;
-    if (x == "nwa" || x == "no-write-allocate" || x == "nowriteallocate")
-        return AllocatePolicy::NO_WRITE_ALLOCATE;
-    cerr << "Unknown allocation policy: " << s << "\n";
+    for (char &c : s)
+        c = tolower(c);
+    if (s == "wa" || s == "writeallocate")
+        return WA;
+    if (s == "nwa" || s == "nowriteallocate")
+        return NWA;
     exit(1);
 }
 
-static u64 parse_u64(const string &s)
+class CacheSim
 {
-    return stoull(s, nullptr, 0);
-}
-
-static bool is_write(char c)
-{
-    return c == 'W' || c == 'w';
-}
-
-class CacheSimulator
-{
-    size_t cache_size, block_size, associativity, num_sets;
-    Policy policy;
-    WritePolicy write_policy;
-    AllocatePolicy alloc_policy;
+    st csz, bsz, assoc, nsets;
+    Policy pol;
+    WritePolicy wp;
+    AllocPolicy ap;
     vector<vector<Line>> sets;
-    unordered_map<u64, deque<u64>> future;
+    unordered_map<u64, deque<u64>> fut; // Beleady's OPT
+    vector<int> ipTable; // hardware predictor table for IGBI.
     mt19937_64 rng;
-    u64 clock_tick = 0;
-    bool optimal_ready = false;
+    u64 clk = 0;
+    bool optRun = false;
 
-    int choose_victim(const vector<Line> &set)
+    int blockForEviction(const vector<Line> &set)
     {
-        if (policy == Policy::RANDOM)
+        if (pol == P_RAND)
+            return rng() % assoc;
+        int targ = 0;
+
+        if (pol == P_FIFO)
         {
-            uniform_int_distribution<int> dist(0, static_cast<int>(associativity - 1));
-            return dist(rng);
+            u64 bst = set[0].inserted;
+            rep(i, 1, assoc) if (set[i].inserted < bst) bst = set[i].inserted, targ = i;
+            return targ;
         }
-
-        int victim = 0;
-
-        if (policy == Policy::FIFO)
+        if (pol == P_LRU || pol == P_IGBI)
         {
-            u64 best = set[0].inserted;
-            for (size_t i = 1; i < associativity; ++i)
+            u64 bst = set[0].lastUse;
+            rep(i, 1, assoc) if (set[i].lastUse < bst) bst = set[i].lastUse, targ = i;
+            return targ;
+        }
+        if (pol == P_MRU)
+        {
+            u64 bst = set[0].lastUse;
+            rep(i, 1, assoc) if (set[i].lastUse > bst) bst = set[i].lastUse, targ = i;
+            return targ;
+        }
+        if (pol == P_LFU)
+        {
+            u64 tf = set[0].freq, tt = set[0].lastUse;
+            rep(i, 1, assoc)
             {
-                if (set[i].inserted < best)
+                if (set[i].freq < tf || (set[i].freq == tf && set[i].lastUse < tt))
                 {
-                    best = set[i].inserted;
-                    victim = static_cast<int>(i);
+                    tf = set[i].freq;
+                    tt = set[i].lastUse;
+                    targ = i;
                 }
             }
-            return victim;
+            return targ;
         }
-
-        if (policy == Policy::LRU)
+        if (pol == P_OPT)
         {
-            u64 best = set[0].last_used;
-            for (size_t i = 1; i < associativity; ++i)
+            u64 far = 0;
+            rep(i, 0, assoc)
             {
-                if (set[i].last_used < best)
-                {
-                    best = set[i].last_used;
-                    victim = static_cast<int>(i);
-                }
+                auto it = fut.find(set[i].block);
+                u64 nxt = (it != fut.end() && !it->second.empty()) ? it->second.front() : ULLONG_MAX;
+                if (nxt == ULLONG_MAX)
+                    return i;
+                if (nxt > far)
+                    far = nxt, targ = i;
             }
-            return victim;
+            return targ;
         }
-
-        if (policy == Policy::CUSTOM)
-        {
-            int unshielded_victim = -1;
-            u64 oldest_unshielded = ULLONG_MAX;
-            
-            int global_victim = 0;
-            u64 oldest_global = ULLONG_MAX;
-
-            for (size_t i = 0; i < associativity; ++i)
-            {
-                if (set[i].last_used < oldest_global)
-                {
-                    oldest_global = set[i].last_used;
-                    global_victim = static_cast<int>(i);
-                }
-
-                if (set[i].freq <= 1 && set[i].last_used < oldest_unshielded)
-                {
-                    oldest_unshielded = set[i].last_used;
-                    unshielded_victim = static_cast<int>(i);
-                }
-            }
-            
-            return (unshielded_victim != -1) ? unshielded_victim : global_victim;
-        }
-
-        if (policy == Policy::MRU)
-        {
-            u64 best = set[0].last_used;
-            for (size_t i = 1; i < associativity; ++i)
-            {
-                if (set[i].last_used > best)
-                {
-                    best = set[i].last_used;
-                    victim = static_cast<int>(i);
-                }
-            }
-            return victim;
-        }
-
-        if (policy == Policy::LFU)
-        {
-            u64 best_freq = set[0].freq;
-            u64 best_time = set[0].last_used;
-            for (size_t i = 1; i < associativity; ++i)
-            {
-                if (set[i].freq < best_freq || (set[i].freq == best_freq && set[i].last_used < best_time))
-                {
-                    best_freq = set[i].freq;
-                    best_time = set[i].last_used;
-                    victim = static_cast<int>(i);
-                }
-            }
-            return victim;
-        }
-
-        if (policy == Policy::OPTIMAL)
-        {
-            u64 farthest = 0;
-            for (size_t i = 0; i < associativity; ++i)
-            {
-                auto it = future.find(set[i].block);
-                u64 next_use = ULLONG_MAX;
-                if (it != future.end() && !it->second.empty())
-                    next_use = it->second.front();
-                if (next_use == ULLONG_MAX)
-                    return static_cast<int>(i);
-                if (next_use > farthest)
-                {
-                    farthest = next_use;
-                    victim = static_cast<int>(i);
-                }
-            }
-            return victim;
-        }
-
-        return 0; 
+        return 0;
     }
 
 public:
-    u64 total_accesses = 0, reads = 0, writes = 0, hits = 0, misses = 0, evictions = 0, write_backs = 0, mem_writes = 0;
+    u64 tot = 0, rds = 0, wrs = 0, hts = 0, mis = 0, evs = 0, wbs = 0, mws = 0;
 
-    CacheSimulator(size_t cache_size_,
-                   size_t block_size_,
-                   size_t associativity_,
-                   Policy policy_,
-                   WritePolicy write_policy_,
-                   AllocatePolicy alloc_policy_)
-        : cache_size(cache_size_),
-          block_size(block_size_),
-          associativity(associativity_),
-          policy(policy_),
-          write_policy(write_policy_),
-          alloc_policy(alloc_policy_),
-          rng(1337)
+    CacheSim(st cs, st bs, st a, Policy p, WritePolicy w, AllocPolicy al)
+        : csz(cs), bsz(bs), assoc(a), pol(p), wp(w), ap(al), rng(1337)
     {
-        if (block_size == 0 || associativity == 0 || cache_size == 0)
-        {
-            cerr << "Cache parameters must be non-zero\n";
+        if (!bsz || !assoc || !csz || csz <= bsz * assoc - 1 || csz % (bsz * assoc))
             exit(1);
-        }
-        if (cache_size < block_size * associativity)
-        {
-            cerr << "Cache size must be at least block_size * associativity\n";
+        nsets = csz / (bsz * assoc);
+        if (!nsets)
             exit(1);
-        }
-        if (cache_size % (block_size * associativity) != 0)
-        {
-            cerr << "Cache size must be divisible by block_size * associativity\n";
-            exit(1);
-        }
-        num_sets = cache_size / (block_size * associativity);
-        if (num_sets == 0)
-        {
-            cerr << "Number of sets became zero\n";
-            exit(1);
-        }
-        sets.assign(num_sets, vector<Line>(associativity));
+        sets.assign(nsets, vector<Line>(assoc));
+        ipTable.assign(16384, 2);
     }
 
-    void preprocess_optimal(const vector<Access> &trace)
+    void precomp(const vector<Access> &tr)
     {
-        future.clear();
-        for (u64 i = 0; i < trace.size(); ++i)
-        {
-            u64 block = trace[i].addr / block_size;
-            future[block].push_back(i);
-        }
-        optimal_ready = true;
+        fut.clear();
+        rep(i, 0, tr.size()) fut[tr[i].addr / bsz].pb(i);
+        optRun = true;
     }
 
-    void access(u64 addr, char type, u64 pos, u64 ip)
+    void access(u64 addr, char typ, u64 pos, u64 ip)
     {
-        total_accesses++;
-        is_write(type) ? writes++ : reads++;
+        tot++;
+        bool is_wr = (typ == 'W' || typ == 'w');
+        is_wr ? wrs++ : rds++;
 
-        u64 block = addr / block_size;
-        size_t set_idx = static_cast<size_t>(block % num_sets);
-        auto &set = sets[set_idx];
+        u64 blk = addr / bsz;
+        auto &set = sets[blk % nsets];
 
-        if (policy == Policy::OPTIMAL && optimal_ready)
+        if (pol == P_OPT && optRun)
         {
-            auto &dq = future[block];
+            auto &dq = fut[blk];
             if (!dq.empty() && dq.front() == pos)
                 dq.pop_front();
         }
 
-        int hit_idx = -1;
-        int empty_idx = -1;
-
-        for (size_t i = 0; i < associativity; ++i)
+        int hit = -1, emp = -1;
+        rep(i, 0, assoc)
         {
-            if (set[i].valid && set[i].block == block)
+            if (set[i].valid && set[i].block == blk)
             {
-                hit_idx = static_cast<int>(i);
+                hit = i;
                 break;
             }
-            if (!set[i].valid && empty_idx == -1)
-                empty_idx = static_cast<int>(i);
+            if (!set[i].valid && emp == -1)
+                emp = i;
         }
 
-        if (hit_idx != -1)
+        if (hit != -1)
         {
-            hits++;
-            auto &line = set[hit_idx];
-            line.last_used = ++clock_tick;
-            line.freq++;
-
-            if (is_write(type))
+            hts++;
+            set[hit].freq++;
+            if (pol == P_IGBI)
             {
-                write_policy == WritePolicy::WRITE_BACK ? line.dirty = true : mem_writes++;
+                u64 hashIP = (set[hit].ip ^ (set[hit].ip >> 4)) % 16384;
+                if (ipTable[hashIP] < 3)
+                    ipTable[hashIP]++;
             }
+            set[hit].lastUse = ++clk;
+            if (is_wr)
+                wp == WB ? set[hit].dirty = true : mws++;
+            return;
+        } 
+
+        mis++;
+        if (is_wr && ap == NWA)
+        {
+            mws++;
             return;
         }
 
-        misses++;
-
-        if (is_write(type) && alloc_policy == AllocatePolicy::NO_WRITE_ALLOCATE)
+        int targ = emp;
+        if (targ == -1)
         {
-            mem_writes++;
-            return;
-        }
-
-        int victim = empty_idx;
-        if (victim == -1)
-        {
-            victim = choose_victim(set);
-            if (set[victim].valid)
+            targ = blockForEviction(set);
+            if (set[targ].valid)
             {
-                evictions++;
-                if (set[victim].dirty && write_policy == WritePolicy::WRITE_BACK)
+                evs++;
+                if (pol == P_IGBI)
                 {
-                    write_backs++;
-                    mem_writes++;
+                    u64 hashedIP = (set[targ].ip ^ (set[targ].ip >> 4)) % 16384;
+                    if (set[targ].freq == 0){
+                        if (ipTable[hashedIP] > 0)
+                            ipTable[hashedIP]--;
+                    }
+                    else{
+                        if (ipTable[hashedIP] < 3)
+                            ipTable[hashedIP]++;
+                    }
                 }
+                if (set[targ].dirty && wp == WB)
+                    wbs++, mws++;
             }
         }
 
-        auto &line = set[victim];
-        line.valid = true;
-        line.dirty = is_write(type) && write_policy == WritePolicy::WRITE_BACK;
-        line.block = block;
-        line.inserted = ++clock_tick;
-        line.last_used = clock_tick;
-        line.freq = 1;
+        set[targ].valid = true;
+        set[targ].dirty = (is_wr && wp == WB);
+        set[targ].block = blk;
+        set[targ].inserted = ++clk;
+        set[targ].freq = (pol == P_IGBI) ? 0 : 1;
 
-        if (is_write(type) && write_policy == WritePolicy::WRITE_THROUGH)
-            mem_writes++;
-
-        if (policy == Policy::OPTIMAL && optimal_ready)
+        if (pol == P_IGBI)
         {
-            auto &dq = future[block];
-            if (!dq.empty() && dq.front() == pos)
-                dq.pop_front();
+            set[targ].ip = ip;
+            u64 new_ip_hash = (ip ^ (ip >> 4)) % 16384;
+            if (ipTable[new_ip_hash] == 0)
+                set[targ].lastUse = 0;
+            else
+                set[targ].lastUse = clk;
         }
+        else
+        {
+            set[targ].lastUse = clk;
+        }
+
+        if (is_wr && wp == WT)
+            mws++;
     }
 
-    void print_report() const
+    void out() const
     {
         cout << fixed << setprecision(2);
-        double total = total_accesses ? static_cast<double>(total_accesses) : 1.0;
-        std::cout << "Hit Rate: " << (100.0 * hits / total) << "%\n"
-                  << "Miss Rate: " << (100.0 * misses / total) << "%\n"
-                  << "Evictions: " << evictions << "\n"
-                  << "Write Backs: " << write_backs << "\n";
+        double dtot = tot ? (double)tot : 1.0;
+        cout << "Hit Rate: " << (100.0 * hts / dtot) << "%\n"
+             << "Miss Rate: " << (100.0 * mis / dtot) << "%\n"
+             << "Evictions: " << evs << "\n"
+             << "Write Backs: " << wbs << "\n";
     }
 };
 
-static bool parse_trace_line(const string &line, Access &a)
+bool parse_tr(const string &line, Access &a)
 {
     if (line.empty() || line[0] == '#')
         return false;
-
     stringstream ss(line);
     vector<string> tok;
     string x;
     while (ss >> x)
-        tok.push_back(x);
+        tok.pb(x);
     if (tok.size() < 2)
         return false;
-
-    char t = static_cast<char>(toupper(static_cast<unsigned char>(tok[0][0])));
+    char t = toupper(tok[0][0]);
     if (t != 'R' && t != 'W')
         return false;
-
     a.type = t;
-    if (tok.size() >= 3)
-    {
-        a.ip = parse_u64(tok[1]);
-        a.addr = parse_u64(tok.back());
-    }
-    else
-    {
-        a.ip = 0;
-        a.addr = parse_u64(tok.back());
-    }
+    a.ip = tok.size() >= 3 ? stoull(tok[1], 0, 0) : 0;
+    a.addr = stoull(tok.back(), 0, 0);
     return true;
-}
-
-static vector<Access> load_trace(const string &path)
-{
-    ifstream in(path);
-    if (!in.is_open())
-    {
-        cerr << "Cannot open trace file: " << path << "\n";
-        exit(1);
-    }
-
-    vector<Access> trace;
-    string line;
-    while (getline(in, line))
-    {
-        Access a{};
-        if (parse_trace_line(line, a))
-            trace.push_back(a);
-    }
-    return trace;
-}
-
-static void print_help()
-{
-    cout << "Usage:\n";
-    cout << "  cache_simulator --size N --block N --assoc N --policy lru|fifo|random|lfu|mru|optimal|custom --write wb|wt --alloc wa|nwa trace.txt\n";
 }
 
 int main(int argc, char *argv[])
 {
-    ios::sync_with_stdio(false);
-    cin.tie(nullptr);
+    ios::sync_with_stdio(0);
+    cin.tie(0);
+    st csz = 32768, bsz = 64, assoc = 8;
+    Policy pol = P_LRU;
+    WritePolicy wp = WB;
+    AllocPolicy ap = WA;
+    string tr_path;
 
-    size_t cache_size = 32768;
-    size_t block_size = 64;
-    size_t assoc = 8;
-    Policy policy = Policy::LRU;
-    WritePolicy write_policy = WritePolicy::WRITE_BACK;
-    AllocatePolicy alloc_policy = AllocatePolicy::WRITE_ALLOCATE;
-    string trace_path;
-
-    for (int i = 1; i < argc; ++i)
+    rep(i, 1, argc)
     {
         string arg = argv[i];
-        if (arg == "--help" || arg == "-h")
-        {
-            print_help();
-            return 0;
-        }
-        else if (arg == "--size" && i + 1 < argc)
-            cache_size = static_cast<size_t>(parse_u64(argv[++i]));
-
-        else if (arg == "--block" && i + 1 < argc)
-            block_size = static_cast<size_t>(parse_u64(argv[++i]));
-
-        else if (arg == "--assoc" && i + 1 < argc)
-            assoc = static_cast<size_t>(parse_u64(argv[++i]));
-
-        else if (arg == "--policy" && i + 1 < argc)
-            policy = parse_policy(argv[++i]);
-
-        else if (arg == "--write" && i + 1 < argc)
-            write_policy = parse_write_policy(argv[++i]);
-
-        else if (arg == "--alloc" && i + 1 < argc)
-            alloc_policy = parse_alloc_policy(argv[++i]);
-
-        else if (arg == "--trace" && i + 1 < argc)
-            trace_path = argv[++i];
-            
-        else if (!arg.empty() && arg[0] == '-')
-        {
-            cerr << "Unknown argument: " << arg << '\n';
-            return 1;
-        }
-        else
-            trace_path = arg;
+        if (arg == "--size" && i + 1 < (st)argc)
+            csz = stoull(argv[++i]);
+        else if (arg == "--block" && i + 1 < (st)argc)
+            bsz = stoull(argv[++i]);
+        else if (arg == "--assoc" && i + 1 < (st)argc)
+            assoc = stoull(argv[++i]);
+        else if (arg == "--policy" && i + 1 < (st)argc)
+            pol = parse_pol(argv[++i]);
+        else if (arg == "--write" && i + 1 < (st)argc)
+            wp = parse_wp(argv[++i]);
+        else if (arg == "--alloc" && i + 1 < (st)argc)
+            ap = parse_ap(argv[++i]);
+        else if (arg == "--trace" && i + 1 < (st)argc)
+            tr_path = argv[++i];
+        else if (arg[0] != '-')
+            tr_path = arg;
     }
 
-    if (trace_path.empty())
+    if (tr_path.empty())
+        exit(1);
+
+    ifstream in(tr_path);
+    if (!in.is_open())
+        exit(1);
+    vector<Access> tr;
+    string ln;
+
+    while (getline(in, ln))
     {
-        print_help();
-        return 1;
+        Access a{};
+        if (parse_tr(ln, a))
+            tr.pb(a);
     }
 
-    vector<Access> trace = load_trace(trace_path);
-    CacheSimulator sim(cache_size, block_size, assoc, policy, write_policy, alloc_policy);
-    if (policy == Policy::OPTIMAL)
-        sim.preprocess_optimal(trace);
-
-    for (u64 i = 0; i < trace.size(); ++i)
-    {
-        sim.access(trace[i].addr, trace[i].type, i, trace[i].ip);
-    }
-
-    sim.print_report();
+    CacheSim sim(csz, bsz, assoc, pol, wp, ap);
+    if (pol == P_OPT)
+        sim.precomp(tr);
+    rep(i, 0, tr.size()) sim.access(tr[i].addr, tr[i].type, i, tr[i].ip);
+    sim.out();
     return 0;
 }

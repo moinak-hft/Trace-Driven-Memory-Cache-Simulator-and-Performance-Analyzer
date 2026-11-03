@@ -1,342 +1,138 @@
-#include <bits/stdc++.h>
-using namespace std;
-#define pb push_back
-#define F first
-#define S second
-using u64 = uint64_t;
-using st = size_t;
-#define rep(i, a, b) for (st i = a; i < b; i++)
+#include "include/cachelab/cache.hpp"
+#include "include/cachelab/dataset.hpp"
+#include <chrono>
+#include <filesystem>
+#include <iostream>
+#include <set>
 
-enum Policy { P_LRU, P_FIFO, P_RAND, P_LFU, P_MRU, P_OPT, P_IGBI };
-enum WritePolicy { WB, WT };
-enum AllocPolicy { WA, NWA };
+using namespace cachelab;
 
-struct Access
-{
-    char type;
-    u64 ip, addr;
-};
-
-struct Line
-{
-    bool valid = false, dirty = false;
-    u64 block = 0, inserted = 0, lastUse = 0, freq = 0, ip = 0;
-};
-
-Policy parse_pol(string s)
-{
-    for (char &c : s)
-        c = tolower(c);
-    if (s == "lru")
-        return P_LRU;
-    if (s == "fifo")
-        return P_FIFO;
-    if (s == "random")
-        return P_RAND;
-    if (s == "lfu")
-        return P_LFU;
-    if (s == "mru")
-        return P_MRU;
-    if (s == "optimal" || s == "belady" || s == "min")
-        return P_OPT;
-    if (s == "custom" || s == "igbi")
-        return P_IGBI;
-    exit(1);
+static void help() {
+    std::cout << "CacheLab: trace-driven data cache simulation with learned reuse prediction\n"
+        "Usage: cache_simulator --trace FILE [options]\n"
+        "  --size BYTES --block BYTES --assoc WAYS\n"
+        "  --policy lru|fifo|random|lfu|mru|optimal|igbi|lip|srrip|ml\n"
+        "  --write wb|wt --alloc wa|nwa --seed N\n"
+        "  --model FILE [--threshold 0..1]    Required by ml\n"
+        "  --warmup N --limit N              Block accesses; limit 0 = all\n"
+        "  --hit-cycles N --miss-penalty N    First-order AMAT assumptions\n"
+        "  --json --flush                    JSON output; optional final dirty flush\n"
+        "  --export-dataset FILE --horizon K Export causal features and reuse labels\n"
+        "Trace: R|W address OR R|W pc address [byte_count]; # comments allowed.\n";
 }
 
-WritePolicy parse_wp(string s)
-{
-    for (char &c : s)
-        c = tolower(c);
-    if (s == "wb" || s == "writeback")
-        return WB;
-    if (s == "wt" || s == "writethrough")
-        return WT;
-    exit(1);
+static double real_number(const std::string& value) {
+    std::size_t used = 0; double result = std::stod(value, &used);
+    if (used != value.size() || !std::isfinite(result)) throw std::runtime_error("invalid number: " + value);
+    return result;
 }
+static bool power_of_two(u64 n) { return n && !(n & (n-1)); }
 
-AllocPolicy parse_ap(string s)
-{
-    for (char &c : s)
-        c = tolower(c);
-    if (s == "wa" || s == "writeallocate")
-        return WA;
-    if (s == "nwa" || s == "nowriteallocate")
-        return NWA;
-    exit(1);
-}
-
-class CacheSim
-{
-    st csz, bsz, assoc, nsets;
-    Policy pol;
-    WritePolicy wp;
-    AllocPolicy ap;
-    vector<vector<Line>> sets;
-    unordered_map<u64, deque<u64>> fut; // Beleady's OPT
-    vector<int> ipTable; // hardware predictor table for IGBI.
-    mt19937_64 rng;
-    u64 clk = 0;
-    bool optRun = false;
-
-    int blockForEviction(const vector<Line> &set)
-    {
-        if (pol == P_RAND)
-            return rng() % assoc;
-        int targ = 0;
-
-        if (pol == P_FIFO)
-        {
-            u64 bst = set[0].inserted;
-            rep(i, 1, assoc) if (set[i].inserted < bst) bst = set[i].inserted, targ = i;
-            return targ;
+int main(int argc, char** argv) {
+    try {
+        Config c;
+        std::string trace, dataset;
+        u64 horizon = 256;
+        bool json = false, threshold_supplied = false;
+        for (int i = 1; i < argc; ++i) {
+            const std::string arg = argv[i];
+            const auto value = [&]() -> std::string {
+                if (i+1 == argc) throw std::runtime_error("missing value for " + arg);
+                return argv[++i];
+            };
+            if (arg == "--help" || arg == "-h") { help(); return 0; }
+            else if (arg == "--size") c.size = integer(value());
+            else if (arg == "--block") c.block = integer(value());
+            else if (arg == "--assoc") c.assoc = integer(value());
+            else if (arg == "--policy") c.policy = value();
+            else if (arg == "--write") c.write = value();
+            else if (arg == "--alloc") c.alloc = value();
+            else if (arg == "--trace") trace = value();
+            else if (arg == "--model") c.model_path = value();
+            else if (arg == "--threshold") { c.threshold = real_number(value()); threshold_supplied = true; }
+            else if (arg == "--seed") c.seed = integer(value());
+            else if (arg == "--warmup") c.warmup = integer(value());
+            else if (arg == "--limit") c.limit = integer(value());
+            else if (arg == "--hit-cycles") c.hit_cycles = real_number(value());
+            else if (arg == "--miss-penalty") c.miss_penalty = real_number(value());
+            else if (arg == "--horizon") horizon = integer(value());
+            else if (arg == "--export-dataset") dataset = value();
+            else if (arg == "--json") json = true;
+            else if (arg == "--flush") c.flush = true;
+            else if (!arg.empty() && arg[0] != '-' && trace.empty()) trace = arg;
+            else throw std::runtime_error("unknown argument: " + arg);
         }
-        if (pol == P_LRU || pol == P_IGBI)
-        {
-            u64 bst = set[0].lastUse;
-            rep(i, 1, assoc) if (set[i].lastUse < bst) bst = set[i].lastUse, targ = i;
-            return targ;
+        const std::set<std::string> policies{"lru","fifo","random","lfu","mru","optimal","igbi","lip","srrip","ml"};
+        if (!policies.count(c.policy)) throw std::runtime_error("unknown policy: " + c.policy);
+        if (trace.empty()) throw std::runtime_error("--trace is required; use --help for usage");
+        if (!power_of_two(c.block) || !power_of_two(c.size) || !power_of_two(c.assoc) ||
+            c.assoc > c.size/c.block || c.size % (c.block*c.assoc))
+            throw std::runtime_error("size, block and associativity must be positive powers of two with size >= block*assoc");
+        if (c.write != "wb" && c.write != "wt") throw std::runtime_error("--write must be wb or wt");
+        if (c.alloc != "wa" && c.alloc != "nwa") throw std::runtime_error("--alloc must be wa or nwa");
+        if (c.policy == "optimal" && c.alloc != "wa") throw std::runtime_error("optimal baseline requires write allocation (--alloc wa)");
+        if (c.hit_cycles < 0 || c.miss_penalty < 0) throw std::runtime_error("latencies must be nonnegative");
+        if (threshold_supplied && (c.threshold < 0 || c.threshold > 1)) throw std::runtime_error("threshold must be between 0 and 1");
+        if (!horizon || horizon > 10000000) throw std::runtime_error("horizon must be 1..10000000");
+        if (!dataset.empty()) {
+            if (std::filesystem::weakly_canonical(trace) == std::filesystem::weakly_canonical(dataset))
+                throw std::runtime_error("dataset output must differ from trace");
+            if (c.warmup || c.limit) throw std::runtime_error("dataset export uses full traces; omit --warmup and --limit");
+            const auto rows = export_dataset(trace, dataset, c.block, horizon);
+            std::cout << "Dataset rows: " << rows << " (last " << horizon << " accesses censored)\n";
+            return 0;
         }
-        if (pol == P_MRU)
-        {
-            u64 bst = set[0].lastUse;
-            rep(i, 1, assoc) if (set[i].lastUse > bst) bst = set[i].lastUse, targ = i;
-            return targ;
+        if (c.policy == "ml" && c.model_path.empty()) throw std::runtime_error("ml requires --model FILE");
+        Cache cache(c);
+        const auto start = std::chrono::steady_clock::now();
+        u64 count = 0;
+        const auto keep = [&]() { return !c.limit || count < c.warmup || count-c.warmup < c.limit; };
+        if (c.policy == "optimal") {
+            std::vector<Access> accesses;
+            visit_trace(trace, c.block, [&](const Access& a) {
+                if (!keep()) return false;
+                accesses.push_back(a); ++count; return keep();
+            });
+            cache.prepare_optimal(accesses);
+            for (std::size_t i = 0; i < accesses.size(); ++i) cache.access(accesses[i], i, i >= c.warmup);
+        } else {
+            visit_trace(trace, c.block, [&](const Access& a) {
+                if (!keep()) return false;
+                cache.access(a, count, count >= c.warmup); ++count; return keep();
+            });
         }
-        if (pol == P_LFU)
-        {
-            u64 tf = set[0].freq, tt = set[0].lastUse;
-            rep(i, 1, assoc)
-            {
-                if (set[i].freq < tf || (set[i].freq == tf && set[i].lastUse < tt))
-                {
-                    tf = set[i].freq;
-                    tt = set[i].lastUse;
-                    targ = i;
-                }
-            }
-            return targ;
-        }
-        if (pol == P_OPT)
-        {
-            u64 far = 0;
-            rep(i, 0, assoc)
-            {
-                auto it = fut.find(set[i].block);
-                u64 nxt = (it != fut.end() && !it->second.empty()) ? it->second.front() : ULLONG_MAX;
-                if (nxt == ULLONG_MAX)
-                    return i;
-                if (nxt > far)
-                    far = nxt, targ = i;
-            }
-            return targ;
+        cache.finish();
+        const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
+        const auto& s = cache.stats;
+        const double hit = s.total_accesses ? double(s.hits)/s.total_accesses : 0;
+        const double miss = s.total_accesses ? double(s.misses)/s.total_accesses : 0;
+        const double amat = s.total_accesses ? c.hit_cycles + miss*c.miss_penalty : 0;
+        std::cout << std::setprecision(12);
+        if (json) {
+            std::cout << "{\"schema_version\":1,\"policy\":\"" << c.policy << "\"";
+            const auto field = [&](const char* key, auto value) { std::cout << ",\"" << key << "\":" << value; };
+            field("cache_size",c.size); field("block_size",c.block); field("associativity",c.assoc); field("seed",c.seed);
+            field("total_accesses",s.total_accesses); field("hits",s.hits); field("misses",s.misses);
+            field("read_accesses",s.read_accesses); field("write_accesses",s.write_accesses);
+            field("read_misses",s.read_misses); field("write_misses",s.write_misses);
+            field("hit_rate",hit); field("miss_rate",miss); field("evictions",s.evictions);
+            field("write_backs",s.write_backs); field("flush_write_backs",s.flush_write_backs);
+            field("memory_reads",s.memory_reads); field("memory_writes",s.memory_writes);
+            field("memory_read_bytes",s.memory_read_bytes); field("memory_write_bytes",s.memory_write_bytes);
+            field("memory_traffic_bytes",s.memory_read_bytes+s.memory_write_bytes);
+            field("warmup_accesses",s.warmup_accesses); field("amat_cycles",amat);
+            field("hit_cycles",c.hit_cycles); field("miss_penalty",c.miss_penalty);
+            field("ml_predictions",s.ml_predictions); field("ml_low_priority_insertions",s.ml_low_priority_insertions);
+            field("predictor_software_bytes",cache.predictor_bytes()); field("simulation_seconds",elapsed);
+            field("accesses_per_second",elapsed > 0 ? count/elapsed : 0);
+            std::cout << ",\"write_policy\":\"" << c.write << "\",\"allocation_policy\":\"" << c.alloc << "\"}\n";
+        } else {
+            std::cout << "Policy: " << c.policy << "\nTotal Accesses: " << s.total_accesses
+                << "\nHits: " << s.hits << "\nMisses: " << s.misses << std::fixed << std::setprecision(2)
+                << "\nHit Rate: " << hit*100 << "%\nMiss Rate: " << miss*100 << "%\nEvictions: " << s.evictions
+                << "\nWrite Backs: " << s.write_backs << "\nMemory Traffic Bytes: " << s.memory_read_bytes+s.memory_write_bytes
+                << "\nEstimated AMAT (cycles): " << amat << "\nSimulation Seconds: " << elapsed << '\n';
         }
         return 0;
-    }
-
-public:
-    u64 tot = 0, rds = 0, wrs = 0, hts = 0, mis = 0, evs = 0, wbs = 0, mws = 0;
-
-    CacheSim(st cs, st bs, st a, Policy p, WritePolicy w, AllocPolicy al)
-        : csz(cs), bsz(bs), assoc(a), pol(p), wp(w), ap(al), rng(1337)
-    {
-        if (!bsz || !assoc || !csz || csz <= bsz * assoc - 1 || csz % (bsz * assoc))
-            exit(1);
-        nsets = csz / (bsz * assoc);
-        if (!nsets)
-            exit(1);
-        sets.assign(nsets, vector<Line>(assoc));
-        ipTable.assign(16384, 2);
-    }
-
-    void precomp(const vector<Access> &tr)
-    {
-        fut.clear();
-        rep(i, 0, tr.size()) fut[tr[i].addr / bsz].pb(i);
-        optRun = true;
-    }
-
-    void access(u64 addr, char typ, u64 pos, u64 ip)
-    {
-        tot++;
-        bool is_wr = (typ == 'W' || typ == 'w');
-        is_wr ? wrs++ : rds++;
-
-        u64 blk = addr / bsz;
-        auto &set = sets[blk % nsets];
-
-        if (pol == P_OPT && optRun)
-        {
-            auto &dq = fut[blk];
-            if (!dq.empty() && dq.front() == pos)
-                dq.pop_front();
-        }
-
-        int hit = -1, emp = -1;
-        rep(i, 0, assoc)
-        {
-            if (set[i].valid && set[i].block == blk)
-            {
-                hit = i;
-                break;
-            }
-            if (!set[i].valid && emp == -1)
-                emp = i;
-        }
-
-        if (hit != -1)
-        {
-            hts++;
-            set[hit].freq++;
-            if (pol == P_IGBI)
-            {
-                u64 hashIP = (set[hit].ip ^ (set[hit].ip >> 4)) % 16384;
-                if (ipTable[hashIP] < 3)
-                    ipTable[hashIP]++;
-            }
-            set[hit].lastUse = ++clk;
-            if (is_wr)
-                wp == WB ? set[hit].dirty = true : mws++;
-            return;
-        } 
-
-        mis++;
-        if (is_wr && ap == NWA)
-        {
-            mws++;
-            return;
-        }
-
-        int targ = emp;
-        if (targ == -1)
-        {
-            targ = blockForEviction(set);
-            if (set[targ].valid)
-            {
-                evs++;
-                if (pol == P_IGBI)
-                {
-                    u64 hashedIP = (set[targ].ip ^ (set[targ].ip >> 4)) % 16384;
-                    if (set[targ].freq == 0){
-                        if (ipTable[hashedIP] > 0)
-                            ipTable[hashedIP]--;
-                    }
-                    else{
-                        if (ipTable[hashedIP] < 3)
-                            ipTable[hashedIP]++;
-                    }
-                }
-                if (set[targ].dirty && wp == WB)
-                    wbs++, mws++;
-            }
-        }
-
-        set[targ].valid = true;
-        set[targ].dirty = (is_wr && wp == WB);
-        set[targ].block = blk;
-        set[targ].inserted = ++clk;
-        set[targ].freq = (pol == P_IGBI) ? 0 : 1;
-
-        if (pol == P_IGBI)
-        {
-            set[targ].ip = ip;
-            u64 new_ip_hash = (ip ^ (ip >> 4)) % 16384;
-            if (ipTable[new_ip_hash] == 0)
-                set[targ].lastUse = 0;
-            else
-                set[targ].lastUse = clk;
-        }
-        else
-        {
-            set[targ].lastUse = clk;
-        }
-
-        if (is_wr && wp == WT)
-            mws++;
-    }
-
-    void out() const
-    {
-        cout << fixed << setprecision(2);
-        double dtot = tot ? (double)tot : 1.0;
-        cout << "Hit Rate: " << (100.0 * hts / dtot) << "%\n"
-             << "Miss Rate: " << (100.0 * mis / dtot) << "%\n"
-             << "Evictions: " << evs << "\n"
-             << "Write Backs: " << wbs << "\n";
-    }
-};
-
-bool parse_tr(const string &line, Access &a)
-{
-    if (line.empty() || line[0] == '#')
-        return false;
-    stringstream ss(line);
-    vector<string> tok;
-    string x;
-    while (ss >> x)
-        tok.pb(x);
-    if (tok.size() < 2)
-        return false;
-    char t = toupper(tok[0][0]);
-    if (t != 'R' && t != 'W')
-        return false;
-    a.type = t;
-    a.ip = tok.size() >= 3 ? stoull(tok[1], 0, 0) : 0;
-    a.addr = stoull(tok.back(), 0, 0);
-    return true;
-}
-
-int main(int argc, char *argv[])
-{
-    ios::sync_with_stdio(0);
-    cin.tie(0);
-    st csz = 32768, bsz = 64, assoc = 8;
-    Policy pol = P_LRU;
-    WritePolicy wp = WB;
-    AllocPolicy ap = WA;
-    string tr_path;
-
-    rep(i, 1, argc)
-    {
-        string arg = argv[i];
-        if (arg == "--size" && i + 1 < (st)argc)
-            csz = stoull(argv[++i]);
-        else if (arg == "--block" && i + 1 < (st)argc)
-            bsz = stoull(argv[++i]);
-        else if (arg == "--assoc" && i + 1 < (st)argc)
-            assoc = stoull(argv[++i]);
-        else if (arg == "--policy" && i + 1 < (st)argc)
-            pol = parse_pol(argv[++i]);
-        else if (arg == "--write" && i + 1 < (st)argc)
-            wp = parse_wp(argv[++i]);
-        else if (arg == "--alloc" && i + 1 < (st)argc)
-            ap = parse_ap(argv[++i]);
-        else if (arg == "--trace" && i + 1 < (st)argc)
-            tr_path = argv[++i];
-        else if (arg[0] != '-')
-            tr_path = arg;
-    }
-
-    if (tr_path.empty())
-        exit(1);
-
-    ifstream in(tr_path);
-    if (!in.is_open())
-        exit(1);
-    vector<Access> tr;
-    string ln;
-
-    while (getline(in, ln))
-    {
-        Access a{};
-        if (parse_tr(ln, a))
-            tr.pb(a);
-    }
-
-    CacheSim sim(csz, bsz, assoc, pol, wp, ap);
-    if (pol == P_OPT)
-        sim.precomp(tr);
-    rep(i, 0, tr.size()) sim.access(tr[i].addr, tr[i].type, i, tr[i].ip);
-    sim.out();
-    return 0;
+    } catch (const std::exception& e) { std::cerr << "error: " << e.what() << '\n'; return 1; }
 }

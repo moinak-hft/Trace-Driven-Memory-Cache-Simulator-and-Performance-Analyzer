@@ -1,0 +1,17 @@
+/cache_simulator
+/cache_simulator.exe
+/target_workload
+/target_workload.exe
+/build/
+/backups/
+/.cache/
+**/.training-cache/
+__pycache__/
+*.pyc
+/traces/
+/results/
+/models/
+/pin-*/
+/pin-*.tar.gz
+/pinatrace.out
+/pin.log

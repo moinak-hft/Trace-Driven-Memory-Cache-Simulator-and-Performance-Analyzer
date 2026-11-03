@@ -1,0 +1,2 @@
+TOOL_ROOTS := pin_trace
+TEST_ROOTS :=

@@ -1,0 +1,11 @@
+name: Linux build and experiment checks
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test
+        run: make test
+      - name: Run ML experiment smoke check
+        run: python3 run_demo.py --quick

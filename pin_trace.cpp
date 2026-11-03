@@ -2,60 +2,61 @@
 #include <cstdio>
 #include <string>
 
-using namespace std;
+// Sized data-access traces, optionally restricted to explicit ROI markers.
+// Threads have independent ROI state; callbacks serialize writes to one file.
+// This records a tool-observed interleaving, not a multicore/coherence model.
+KNOB<std::string> Output(KNOB_MODE_WRITEONCE,"pintool","o","pinatrace.out","output trace");
+KNOB<BOOL> ROI(KNOB_MODE_WRITEONCE,"pintool","roi","0","trace only between cachelab_roi_begin/end");
+static FILE* trace_file=nullptr;
+static PIN_LOCK trace_lock;
+static TLS_KEY thread_key;
+struct State { bool active; };
 
-FILE *TraceFile = nullptr;
-
-KNOB<string> KnobOutput(KNOB_MODE_WRITEONCE, "pintool", "o", "pinatrace.out", "output trace file");
-
-VOID RecordMemRead(VOID *ip, VOID *addr)
-{
-    fprintf(TraceFile, "R %p %p\n", ip, addr);
+static VOID ThreadStart(THREADID tid,CONTEXT*,INT32,VOID*) {
+    PIN_SetThreadData(thread_key,new State{!ROI.Value()},tid);
 }
-
-VOID RecordMemWrite(VOID *ip, VOID *addr)
-{
-    fprintf(TraceFile, "W %p %p\n", ip, addr);
+static VOID ThreadEnd(THREADID tid,const CONTEXT*,INT32,VOID*) {
+    delete static_cast<State*>(PIN_GetThreadData(thread_key,tid));
 }
-
-VOID Instruction(INS ins, VOID *v)
-{
-    UINT32 memOperands = INS_MemoryOperandCount(ins);
-
-    for (UINT32 memOp = 0; memOp < memOperands; memOp++) {
-        if (INS_MemoryOperandIsRead(ins, memOp)) {
-            INS_InsertPredicatedCall(
-                ins, IPOINT_BEFORE, (AFUNPTR)RecordMemRead,
-                IARG_INST_PTR,
-                IARG_MEMORYOP_EA, memOp,
-                IARG_END);
-        }
-
-        if (INS_MemoryOperandIsWritten(ins, memOp)) {
-            INS_InsertPredicatedCall(
-                ins, IPOINT_BEFORE, (AFUNPTR)RecordMemWrite,
-                IARG_INST_PTR,
-                IARG_MEMORYOP_EA, memOp,
-                IARG_END);
-        }
+static VOID Begin(THREADID tid) { static_cast<State*>(PIN_GetThreadData(thread_key,tid))->active=true; }
+static VOID End(THREADID tid) { static_cast<State*>(PIN_GetThreadData(thread_key,tid))->active=false; }
+static VOID Routine(RTN routine,VOID*) {
+    const std::string name=RTN_Name(routine);
+    if(name!="cachelab_roi_begin" && name!="cachelab_roi_end") return;
+    RTN_Open(routine);
+    RTN_InsertCall(routine,IPOINT_BEFORE,AFUNPTR(name=="cachelab_roi_begin"?Begin:End),IARG_THREAD_ID,IARG_END);
+    RTN_Close(routine);
+}
+static VOID Record(THREADID tid,ADDRINT pc,ADDRINT address,UINT32 bytes,UINT32 write) {
+    auto* state=static_cast<State*>(PIN_GetThreadData(thread_key,tid));
+    if(ROI.Value() && (!state || !state->active)) return;
+    PIN_GetLock(&trace_lock,tid+1);
+    std::fprintf(trace_file,"%c 0x%llx 0x%llx %u\n",write?'W':'R',
+                 static_cast<unsigned long long>(pc),static_cast<unsigned long long>(address),bytes);
+    PIN_ReleaseLock(&trace_lock);
+}
+static VOID Instruction(INS ins,VOID*) {
+    for(UINT32 op=0;op<INS_MemoryOperandCount(ins);++op) {
+        if(INS_MemoryOperandIsRead(ins,op)) INS_InsertPredicatedCall(ins,IPOINT_BEFORE,AFUNPTR(Record),
+            IARG_THREAD_ID,IARG_INST_PTR,IARG_MEMORYOP_EA,op,IARG_UINT32,INS_MemoryOperandSize(ins,op),IARG_UINT32,0,IARG_END);
+        if(INS_MemoryOperandIsWritten(ins,op)) INS_InsertPredicatedCall(ins,IPOINT_BEFORE,AFUNPTR(Record),
+            IARG_THREAD_ID,IARG_INST_PTR,IARG_MEMORYOP_EA,op,IARG_UINT32,INS_MemoryOperandSize(ins,op),IARG_UINT32,1,IARG_END);
     }
 }
-
-VOID Fini(INT32 code, VOID *v)
-{
-    if (TraceFile) fclose(TraceFile);
-}
-
-int main(int argc, char *argv[])
-{
-    if (PIN_Init(argc, argv)) return 1;
-
-    TraceFile = fopen(KnobOutput.Value().c_str(), "w");
-    if (!TraceFile) return 1;
-
-    INS_AddInstrumentFunction(Instruction, 0);
-    PIN_AddFiniFunction(Fini, 0);
-
+static VOID Finish(INT32,VOID*) { if(trace_file) std::fclose(trace_file); }
+int main(int argc,char** argv) {
+    PIN_InitSymbols();
+    if(PIN_Init(argc,argv)) return 1;
+    trace_file=std::fopen(Output.Value().c_str(),"w");
+    if(!trace_file) { std::perror("trace output"); return 1; }
+    PIN_InitLock(&trace_lock);
+    thread_key=PIN_CreateThreadDataKey(nullptr);
+    if(thread_key==INVALID_TLS_KEY) return 1;
+    PIN_AddThreadStartFunction(ThreadStart,nullptr);
+    PIN_AddThreadFiniFunction(ThreadEnd,nullptr);
+    RTN_AddInstrumentFunction(Routine,nullptr);
+    INS_AddInstrumentFunction(Instruction,nullptr);
+    PIN_AddFiniFunction(Finish,nullptr);
     PIN_StartProgram();
     return 0;
 }
